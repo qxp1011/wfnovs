@@ -1,0 +1,16 @@
+1)modprobe openvswitch  //install openvswitch.ko
+2)rm -rf /usr/local/etc/openvswitch
+3)mkdir -p /usr/local/etc/openvswitch
+3)ovsdb-tool create /usr/local/etc/openvswitch/conf.db vswitchd/vswitch.ovsschema
+4)ovsdb-server --remote=punix:/usr/local/var/run/openvswitch/db.sock \
+                     --remote=db:Open_vSwitch,Open_vSwitch,manager_options \
+                     --private-key=db:Open_vSwitch,SSL,private_key \
+                     --certificate=db:Open_vSwitch,SSL,certificate \
+                     --bootstrap-ca-cert=db:Open_vSwitch,SSL,ca_cert \
+                     --pidfile --detach
+5)ovs-vsctl --no-wait init
+6)ovs-vsctl add-br br0
+7)ovs-vsctl add-port br0 eth0
+8)ovs-vsctl set-controller br0 tcp:10.1.1.1:6633
+
+8)ovs-vswitchd --pidfile=ovs-vswitchd.pid --overwrite-pidfile --log-file

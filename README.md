@@ -1,2 +1,5 @@
 wfnovs
 ======
+
+WFNOVS is open switch by WFN Team, It is based on the openvswitch(openvswitch.org) and has many advanced features. It is 100% compatible with openvswitch
+WFNOVS is a community effort and everyone is encouraged to get involve
