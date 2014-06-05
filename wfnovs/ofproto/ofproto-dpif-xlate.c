@@ -65,8 +65,6 @@ VLOG_DEFINE_THIS_MODULE(ofproto_dpif_xlate);
  * recursive or not. */
 #define MAX_RESUBMITS (MAX_RESUBMIT_RECURSION * MAX_RESUBMIT_RECURSION)
 
-struct ovs_rwlock xlate_rwlock = OVS_RWLOCK_INITIALIZER;
-
 struct xbridge {
     struct hmap_node hmap_node;   /* Node in global 'xbridges' map. */
     struct ofproto_dpif *ofproto; /* Key in global 'xbridges' map. */
@@ -268,7 +266,8 @@ struct xc_entry {
         } bond;
         struct {
             struct ofproto_dpif *ofproto;
-            struct rule_dpif *rule;
+            struct ofputil_flow_mod *fm;
+            struct ofpbuf *ofpacts;
         } learn;
         struct {
             struct ofproto_dpif *ofproto;
@@ -297,15 +296,22 @@ struct xlate_cache {
     struct ofpbuf entries;
 };
 
-static struct hmap xbridges = HMAP_INITIALIZER(&xbridges);
-static struct hmap xbundles = HMAP_INITIALIZER(&xbundles);
-static struct hmap xports = HMAP_INITIALIZER(&xports);
+/* Xlate config contains hash maps of all bridges, bundles and ports.
+ * Xcfgp contains the pointer to the current xlate configuration.
+ * When the main thread needs to change the configuration, it copies xcfgp to
+ * new_xcfg and edits new_xcfg. This enables the use of RCU locking which
+ * does not block handler and revalidator threads. */
+struct xlate_cfg {
+    struct hmap xbridges;
+    struct hmap xbundles;
+    struct hmap xports;
+};
+static OVSRCU_TYPE(struct xlate_cfg *) xcfgp = OVSRCU_TYPE_INITIALIZER;
+static struct xlate_cfg *new_xcfg = NULL;
 
 static bool may_receive(const struct xport *, struct xlate_ctx *);
 static void do_xlate_actions(const struct ofpact *, size_t ofpacts_len,
                              struct xlate_ctx *);
-static void xlate_actions__(struct xlate_in *, struct xlate_out *)
-    OVS_REQ_RDLOCK(xlate_rwlock);
 static void xlate_normal(struct xlate_ctx *);
 static void xlate_report(struct xlate_ctx *, const char *);
 static void xlate_table_action(struct xlate_ctx *, ofp_port_t in_port,
@@ -317,9 +323,12 @@ static void output_normal(struct xlate_ctx *, const struct xbundle *,
                           uint16_t vlan);
 static void compose_output_action(struct xlate_ctx *, ofp_port_t ofp_port);
 
-static struct xbridge *xbridge_lookup(const struct ofproto_dpif *);
-static struct xbundle *xbundle_lookup(const struct ofbundle *);
-static struct xport *xport_lookup(const struct ofport_dpif *);
+static struct xbridge *xbridge_lookup(struct xlate_cfg *,
+                                      const struct ofproto_dpif *);
+static struct xbundle *xbundle_lookup(struct xlate_cfg *,
+                                      const struct ofbundle *);
+static struct xport *xport_lookup(struct xlate_cfg *,
+                                  const struct ofport_dpif *);
 static struct xport *get_ofp_port(const struct xbridge *, ofp_port_t ofp_port);
 static struct skb_priority_to_dscp *get_skb_priority(const struct xport *,
                                                      uint32_t skb_priority);
@@ -329,10 +338,76 @@ static bool dscp_from_skb_priority(const struct xport *, uint32_t skb_priority,
 
 static struct xc_entry *xlate_cache_add_entry(struct xlate_cache *xc,
                                               enum xc_type type);
+static void xlate_xbridge_init(struct xlate_cfg *, struct xbridge *);
+static void xlate_xbundle_init(struct xlate_cfg *, struct xbundle *);
+static void xlate_xport_init(struct xlate_cfg *, struct xport *);
+static void xlate_xbridge_set(struct xbridge *xbridge,
+                              struct dpif *dpif,
+                              struct rule_dpif *miss_rule,
+                  struct rule_dpif *no_packet_in_rule,
+                  const struct mac_learning *ml, struct stp *stp,
+                  const struct mbridge *mbridge,
+                  const struct dpif_sflow *sflow,
+                  const struct dpif_ipfix *ipfix,
+                              const struct netflow *netflow,
+                              enum ofp_config_flags frag,
+                  bool forward_bpdu, bool has_in_band,
+                  bool enable_recirc,
+                  bool variable_length_userdata,
+                              size_t max_mpls_depth);
+static void xlate_xbundle_set(struct xbundle *xbundle,
+                              enum port_vlan_mode vlan_mode, int vlan,
+                              unsigned long *trunks, bool use_priority_tags,
+                              const struct bond *bond, const struct lacp *lacp,
+                              bool floodable);
+static void xlate_xport_set(struct xport *xport, odp_port_t odp_port,
+                            const struct netdev *netdev, const struct cfm *cfm,
+                            const struct bfd *bfd, int stp_port_no,
+                            enum ofputil_port_config config,
+                            enum ofputil_port_state state, bool is_tunnel,
+                            bool may_enable);
+static void xlate_xbridge_remove(struct xlate_cfg *, struct xbridge *);
+static void xlate_xbundle_remove(struct xlate_cfg *, struct xbundle *);
+static void xlate_xport_remove(struct xlate_cfg *, struct xport *);
+static void xlate_xbridge_copy(struct xbridge *);
+static void xlate_xbundle_copy(struct xbridge *, struct xbundle *);
+static void xlate_xport_copy(struct xbridge *, struct xbundle *,
+                             struct xport *);
+static void xlate_xcfg_free(struct xlate_cfg *);
 
-void
-xlate_ofproto_set(struct ofproto_dpif *ofproto, const char *name,
-                  struct dpif *dpif, struct rule_dpif *miss_rule,
+
+static void
+xlate_xbridge_init(struct xlate_cfg *xcfg, struct xbridge *xbridge)
+{
+    list_init(&xbridge->xbundles);
+    hmap_init(&xbridge->xports);
+    hmap_insert(&xcfg->xbridges, &xbridge->hmap_node,
+                hash_pointer(xbridge->ofproto, 0));
+}
+
+static void
+xlate_xbundle_init(struct xlate_cfg *xcfg, struct xbundle *xbundle)
+{
+    list_init(&xbundle->xports);
+    list_insert(&xbundle->xbridge->xbundles, &xbundle->list_node);
+    hmap_insert(&xcfg->xbundles, &xbundle->hmap_node,
+                hash_pointer(xbundle->ofbundle, 0));
+}
+
+static void
+xlate_xport_init(struct xlate_cfg *xcfg, struct xport *xport)
+{
+    hmap_init(&xport->skb_priorities);
+    hmap_insert(&xcfg->xports, &xport->hmap_node,
+                hash_pointer(xport->ofport, 0));
+    hmap_insert(&xport->xbridge->xports, &xport->ofp_node,
+                hash_ofp_port(xport->ofp_port));
+    }
+
+static void
+xlate_xbridge_set(struct xbridge *xbridge,
+                  struct dpif *dpif,
+                  struct rule_dpif *miss_rule,
                   struct rule_dpif *no_packet_in_rule,
                   const struct mac_learning *ml, struct stp *stp,
                   const struct mbridge *mbridge,
@@ -344,17 +419,6 @@ xlate_ofproto_set(struct ofproto_dpif *ofproto, const char *name,
                   bool variable_length_userdata,
                   size_t max_mpls_depth)
 {
-    struct xbridge *xbridge = xbridge_lookup(ofproto);
-
-    if (!xbridge) {
-        xbridge = xzalloc(sizeof *xbridge);
-        xbridge->ofproto = ofproto;
-
-        hmap_insert(&xbridges, &xbridge->hmap_node, hash_pointer(ofproto, 0));
-        hmap_init(&xbridge->xports);
-        list_init(&xbridge->xbundles);
-    }
-
     if (xbridge->ml != ml) {
         mac_learning_unref(xbridge->ml);
         xbridge->ml = mac_learning_ref(ml);
@@ -385,9 +449,6 @@ xlate_ofproto_set(struct ofproto_dpif *ofproto, const char *name,
         xbridge->netflow = netflow_ref(netflow);
     }
 
-    free(xbridge->name);
-    xbridge->name = xstrdup(name);
-
     xbridge->dpif = dpif;
     xbridge->forward_bpdu = forward_bpdu;
     xbridge->has_in_band = has_in_band;
@@ -399,59 +460,14 @@ xlate_ofproto_set(struct ofproto_dpif *ofproto, const char *name,
     xbridge->max_mpls_depth = max_mpls_depth;
 }
 
-void
-xlate_remove_ofproto(struct ofproto_dpif *ofproto)
+static void
+xlate_xbundle_set(struct xbundle *xbundle,
+                  enum port_vlan_mode vlan_mode, int vlan,
+                  unsigned long *trunks, bool use_priority_tags,
+                  const struct bond *bond, const struct lacp *lacp,
+                  bool floodable)
 {
-    struct xbridge *xbridge = xbridge_lookup(ofproto);
-    struct xbundle *xbundle, *next_xbundle;
-    struct xport *xport, *next_xport;
-
-    if (!xbridge) {
-        return;
-    }
-
-    HMAP_FOR_EACH_SAFE (xport, next_xport, ofp_node, &xbridge->xports) {
-        xlate_ofport_remove(xport->ofport);
-    }
-
-    LIST_FOR_EACH_SAFE (xbundle, next_xbundle, list_node, &xbridge->xbundles) {
-        xlate_bundle_remove(xbundle->ofbundle);
-    }
-
-    hmap_remove(&xbridges, &xbridge->hmap_node);
-    mac_learning_unref(xbridge->ml);
-    mbridge_unref(xbridge->mbridge);
-    dpif_sflow_unref(xbridge->sflow);
-    dpif_ipfix_unref(xbridge->ipfix);
-    stp_unref(xbridge->stp);
-    hmap_destroy(&xbridge->xports);
-    free(xbridge->name);
-    free(xbridge);
-}
-
-void
-xlate_bundle_set(struct ofproto_dpif *ofproto, struct ofbundle *ofbundle,
-                 const char *name, enum port_vlan_mode vlan_mode, int vlan,
-                 unsigned long *trunks, bool use_priority_tags,
-                 const struct bond *bond, const struct lacp *lacp,
-                 bool floodable)
-{
-    struct xbundle *xbundle = xbundle_lookup(ofbundle);
-
-    if (!xbundle) {
-        xbundle = xzalloc(sizeof *xbundle);
-        xbundle->ofbundle = ofbundle;
-        xbundle->xbridge = xbridge_lookup(ofproto);
-
-        hmap_insert(&xbundles, &xbundle->hmap_node, hash_pointer(ofbundle, 0));
-        list_insert(&xbundle->xbridge->xbundles, &xbundle->list_node);
-        list_init(&xbundle->xports);
-    }
-
     ovs_assert(xbundle->xbridge);
-
-    free(xbundle->name);
-    xbundle->name = xstrdup(name);
 
     xbundle->vlan_mode = vlan_mode;
     xbundle->vlan = vlan;
@@ -470,10 +486,299 @@ xlate_bundle_set(struct ofproto_dpif *ofproto, struct ofbundle *ofbundle,
     }
 }
 
-void
-xlate_bundle_remove(struct ofbundle *ofbundle)
+static void
+xlate_xport_set(struct xport *xport, odp_port_t odp_port,
+                const struct netdev *netdev, const struct cfm *cfm,
+                const struct bfd *bfd, int stp_port_no,
+                enum ofputil_port_config config, enum ofputil_port_state state,
+                bool is_tunnel, bool may_enable)
 {
-    struct xbundle *xbundle = xbundle_lookup(ofbundle);
+    xport->config = config;
+    xport->state = state;
+    xport->stp_port_no = stp_port_no;
+    xport->is_tunnel = is_tunnel;
+    xport->may_enable = may_enable;
+    xport->odp_port = odp_port;
+
+    if (xport->cfm != cfm) {
+        cfm_unref(xport->cfm);
+        xport->cfm = cfm_ref(cfm);
+    }
+
+    if (xport->bfd != bfd) {
+        bfd_unref(xport->bfd);
+        xport->bfd = bfd_ref(bfd);
+    }
+
+    if (xport->netdev != netdev) {
+        netdev_close(xport->netdev);
+        xport->netdev = netdev_ref(netdev);
+    }
+}
+
+static void
+xlate_xbridge_copy(struct xbridge *xbridge)
+{
+    struct xbundle *xbundle;
+    struct xport *xport;
+    struct xbridge *new_xbridge = xzalloc(sizeof *xbridge);
+    new_xbridge->ofproto = xbridge->ofproto;
+    new_xbridge->name = xstrdup(xbridge->name);
+    xlate_xbridge_init(new_xcfg, new_xbridge);
+
+    xlate_xbridge_set(new_xbridge,
+                      xbridge->dpif, xbridge->miss_rule,
+                      xbridge->no_packet_in_rule, xbridge->ml, xbridge->stp,
+                      xbridge->mbridge, xbridge->sflow, xbridge->ipfix,
+                      xbridge->netflow, xbridge->frag, xbridge->forward_bpdu,
+                      xbridge->has_in_band, xbridge->enable_recirc,
+                      xbridge->variable_length_userdata,
+                      xbridge->max_mpls_depth);
+    LIST_FOR_EACH (xbundle, list_node, &xbridge->xbundles) {
+        xlate_xbundle_copy(new_xbridge, xbundle);
+    }
+
+    /* Copy xports which are not part of a xbundle */
+    HMAP_FOR_EACH (xport, ofp_node, &xbridge->xports) {
+        if (!xport->xbundle) {
+            xlate_xport_copy(new_xbridge, NULL, xport);
+        }
+    }
+}
+
+static void
+xlate_xbundle_copy(struct xbridge *xbridge, struct xbundle *xbundle)
+{
+    struct xport *xport;
+    struct xbundle *new_xbundle = xzalloc(sizeof *xbundle);
+    new_xbundle->ofbundle = xbundle->ofbundle;
+    new_xbundle->xbridge = xbridge;
+    new_xbundle->name = xstrdup(xbundle->name);
+    xlate_xbundle_init(new_xcfg, new_xbundle);
+
+    xlate_xbundle_set(new_xbundle, xbundle->vlan_mode,
+                      xbundle->vlan, xbundle->trunks,
+                      xbundle->use_priority_tags, xbundle->bond, xbundle->lacp,
+                      xbundle->floodable);
+    LIST_FOR_EACH (xport, bundle_node, &xbundle->xports) {
+        xlate_xport_copy(xbridge, new_xbundle, xport);
+    }
+}
+
+static void
+xlate_xport_copy(struct xbridge *xbridge, struct xbundle *xbundle,
+                 struct xport *xport)
+{
+    struct skb_priority_to_dscp *pdscp, *new_pdscp;
+    struct xport *new_xport = xzalloc(sizeof *xport);
+    new_xport->ofport = xport->ofport;
+    new_xport->ofp_port = xport->ofp_port;
+    new_xport->xbridge = xbridge;
+    xlate_xport_init(new_xcfg, new_xport);
+
+    xlate_xport_set(new_xport, xport->odp_port, xport->netdev, xport->cfm,
+                    xport->bfd, xport->stp_port_no, xport->config, xport->state,
+                    xport->is_tunnel, xport->may_enable);
+
+    if (xport->peer) {
+        struct xport *peer = xport_lookup(new_xcfg, xport->peer->ofport);
+        if (peer) {
+            new_xport->peer = peer;
+            new_xport->peer->peer = new_xport;
+        }
+    }
+
+    if (xbundle) {
+        new_xport->xbundle = xbundle;
+        list_insert(&new_xport->xbundle->xports, &new_xport->bundle_node);
+    }
+
+    HMAP_FOR_EACH (pdscp, hmap_node, &xport->skb_priorities) {
+        new_pdscp = xmalloc(sizeof *pdscp);
+        new_pdscp->skb_priority = pdscp->skb_priority;
+        new_pdscp->dscp = pdscp->dscp;
+        hmap_insert(&new_xport->skb_priorities, &new_pdscp->hmap_node,
+                    hash_int(new_pdscp->skb_priority, 0));
+    }
+}
+
+/* Sets the current xlate configuration to new_xcfg and frees the old xlate
+ * configuration in xcfgp.
+ *
+ * This needs to be called after editing the xlate configuration.
+ *
+ * Functions that edit the new xlate configuration are
+ * xlate_<ofport/bundle/ofport>_set and xlate_<ofport/bundle/ofport>_remove.
+ *
+ * A sample workflow:
+ *
+ * xlate_txn_start();
+ * ...
+ * edit_xlate_configuration();
+ * ...
+ * xlate_txn_commit(); */
+void
+xlate_txn_commit(void)
+{
+    struct xlate_cfg *xcfg = ovsrcu_get(struct xlate_cfg *, &xcfgp);
+
+    ovsrcu_set(&xcfgp, new_xcfg);
+    ovsrcu_postpone(xlate_xcfg_free, xcfg);
+
+    new_xcfg = NULL;
+}
+
+/* Copies the current xlate configuration in xcfgp to new_xcfg.
+ *
+ * This needs to be called prior to editing the xlate configuration. */
+void
+xlate_txn_start(void)
+{
+    struct xbridge *xbridge;
+    struct xlate_cfg *xcfg;
+
+    ovs_assert(!new_xcfg);
+
+    new_xcfg = xmalloc(sizeof *new_xcfg);
+    hmap_init(&new_xcfg->xbridges);
+    hmap_init(&new_xcfg->xbundles);
+    hmap_init(&new_xcfg->xports);
+
+    xcfg = ovsrcu_get(struct xlate_cfg *, &xcfgp);
+    if (!xcfg) {
+        return;
+    }
+
+    HMAP_FOR_EACH (xbridge, hmap_node, &xcfg->xbridges) {
+        xlate_xbridge_copy(xbridge);
+    }
+}
+
+
+static void
+xlate_xcfg_free(struct xlate_cfg *xcfg)
+{
+    struct xbridge *xbridge, *next_xbridge;
+
+    if (!xcfg) {
+        return;
+    }
+
+    HMAP_FOR_EACH_SAFE (xbridge, next_xbridge, hmap_node, &xcfg->xbridges) {
+        xlate_xbridge_remove(xcfg, xbridge);
+    }
+
+    hmap_destroy(&xcfg->xbridges);
+    hmap_destroy(&xcfg->xbundles);
+    hmap_destroy(&xcfg->xports);
+    free(xcfg);
+}
+
+void
+xlate_ofproto_set(struct ofproto_dpif *ofproto, const char *name,
+                  struct dpif *dpif, struct rule_dpif *miss_rule,
+                  struct rule_dpif *no_packet_in_rule,
+                  const struct mac_learning *ml, struct stp *stp,
+                  const struct mbridge *mbridge,
+                  const struct dpif_sflow *sflow,
+                  const struct dpif_ipfix *ipfix,
+                  const struct netflow *netflow, enum ofp_config_flags frag,
+                  bool forward_bpdu, bool has_in_band,
+                  bool enable_recirc,
+                  bool variable_length_userdata,
+                  size_t max_mpls_depth)
+{
+    struct xbridge *xbridge;
+
+    ovs_assert(new_xcfg);
+
+    xbridge = xbridge_lookup(new_xcfg, ofproto);
+    if (!xbridge) {
+        xbridge = xzalloc(sizeof *xbridge);
+        xbridge->ofproto = ofproto;
+
+        xlate_xbridge_init(new_xcfg, xbridge);
+    }
+
+    free(xbridge->name);
+    xbridge->name = xstrdup(name);
+
+    xlate_xbridge_set(xbridge, dpif, miss_rule, no_packet_in_rule, ml, stp,
+                      mbridge, sflow, ipfix, netflow, frag, forward_bpdu,
+                      has_in_band, enable_recirc, variable_length_userdata,
+                      max_mpls_depth);
+}
+
+static void
+xlate_xbridge_remove(struct xlate_cfg *xcfg, struct xbridge *xbridge)
+{
+    struct xbundle *xbundle, *next_xbundle;
+    struct xport *xport, *next_xport;
+
+    if (!xbridge) {
+        return;
+    }
+
+    HMAP_FOR_EACH_SAFE (xport, next_xport, ofp_node, &xbridge->xports) {
+        xlate_xport_remove(xcfg, xport);
+    }
+
+    LIST_FOR_EACH_SAFE (xbundle, next_xbundle, list_node, &xbridge->xbundles) {
+        xlate_xbundle_remove(xcfg, xbundle);
+    }
+
+    hmap_remove(&xcfg->xbridges, &xbridge->hmap_node);
+    mac_learning_unref(xbridge->ml);
+    mbridge_unref(xbridge->mbridge);
+    dpif_sflow_unref(xbridge->sflow);
+    dpif_ipfix_unref(xbridge->ipfix);
+    stp_unref(xbridge->stp);
+    hmap_destroy(&xbridge->xports);
+    free(xbridge->name);
+    free(xbridge);
+}
+
+void
+xlate_remove_ofproto(struct ofproto_dpif *ofproto)
+{
+    struct xbridge *xbridge;
+
+    ovs_assert(new_xcfg);
+
+    xbridge = xbridge_lookup(new_xcfg, ofproto);
+    xlate_xbridge_remove(new_xcfg, xbridge);
+}
+
+void
+xlate_bundle_set(struct ofproto_dpif *ofproto, struct ofbundle *ofbundle,
+                 const char *name, enum port_vlan_mode vlan_mode, int vlan,
+                 unsigned long *trunks, bool use_priority_tags,
+                 const struct bond *bond, const struct lacp *lacp,
+                 bool floodable)
+{
+    struct xbundle *xbundle;
+
+    ovs_assert(new_xcfg);
+
+    xbundle = xbundle_lookup(new_xcfg, ofbundle);
+    if (!xbundle) {
+        xbundle = xzalloc(sizeof *xbundle);
+        xbundle->ofbundle = ofbundle;
+        xbundle->xbridge = xbridge_lookup(new_xcfg, ofproto);
+
+        xlate_xbundle_init(new_xcfg, xbundle);
+    }
+
+    free(xbundle->name);
+    xbundle->name = xstrdup(name);
+
+    xlate_xbundle_set(xbundle, vlan_mode, vlan, trunks,
+                      use_priority_tags, bond, lacp, floodable);
+    }
+
+static void
+xlate_xbundle_remove(struct xlate_cfg *xcfg, struct xbundle *xbundle)
+{
     struct xport *xport, *next;
 
     if (!xbundle) {
@@ -485,12 +790,23 @@ xlate_bundle_remove(struct ofbundle *ofbundle)
         xport->xbundle = NULL;
     }
 
-    hmap_remove(&xbundles, &xbundle->hmap_node);
+    hmap_remove(&xcfg->xbundles, &xbundle->hmap_node);
     list_remove(&xbundle->list_node);
     bond_unref(xbundle->bond);
     lacp_unref(xbundle->lacp);
     free(xbundle->name);
     free(xbundle);
+}
+
+void
+xlate_bundle_remove(struct ofbundle *ofbundle)
+{
+    struct xbundle *xbundle;
+
+    ovs_assert(new_xcfg);
+
+    xbundle = xbundle_lookup(new_xcfg, ofbundle);
+    xlate_xbundle_remove(new_xcfg, xbundle);
 }
 
 void
@@ -504,49 +820,30 @@ xlate_ofport_set(struct ofproto_dpif *ofproto, struct ofbundle *ofbundle,
                  enum ofputil_port_state state, bool is_tunnel,
                  bool may_enable)
 {
-    struct xport *xport = xport_lookup(ofport);
     size_t i;
+    struct xport *xport;
 
+    ovs_assert(new_xcfg);
+
+    xport = xport_lookup(new_xcfg, ofport);
     if (!xport) {
         xport = xzalloc(sizeof *xport);
         xport->ofport = ofport;
-        xport->xbridge = xbridge_lookup(ofproto);
+        xport->xbridge = xbridge_lookup(new_xcfg, ofproto);
         xport->ofp_port = ofp_port;
 
-        hmap_init(&xport->skb_priorities);
-        hmap_insert(&xports, &xport->hmap_node, hash_pointer(ofport, 0));
-        hmap_insert(&xport->xbridge->xports, &xport->ofp_node,
-                    hash_ofp_port(xport->ofp_port));
+        xlate_xport_init(new_xcfg, xport);
     }
 
     ovs_assert(xport->ofp_port == ofp_port);
 
-    xport->config = config;
-    xport->state = state;
-    xport->stp_port_no = stp_port_no;
-    xport->is_tunnel = is_tunnel;
-    xport->may_enable = may_enable;
-    xport->odp_port = odp_port;
-
-    if (xport->netdev != netdev) {
-        netdev_close(xport->netdev);
-        xport->netdev = netdev_ref(netdev);
-    }
-
-    if (xport->cfm != cfm) {
-        cfm_unref(xport->cfm);
-        xport->cfm = cfm_ref(cfm);
-    }
-
-    if (xport->bfd != bfd) {
-        bfd_unref(xport->bfd);
-        xport->bfd = bfd_ref(bfd);
-    }
+    xlate_xport_set(xport, odp_port, netdev, cfm, bfd, stp_port_no, config,
+                    state, is_tunnel, may_enable);
 
     if (xport->peer) {
         xport->peer->peer = NULL;
     }
-    xport->peer = xport_lookup(peer);
+    xport->peer = xport_lookup(new_xcfg, peer);
     if (xport->peer) {
         xport->peer->peer = xport;
     }
@@ -554,7 +851,7 @@ xlate_ofport_set(struct ofproto_dpif *ofproto, struct ofbundle *ofbundle,
     if (xport->xbundle) {
         list_remove(&xport->bundle_node);
     }
-    xport->xbundle = xbundle_lookup(ofbundle);
+    xport->xbundle = xbundle_lookup(new_xcfg, ofbundle);
     if (xport->xbundle) {
         list_insert(&xport->xbundle->xports, &xport->bundle_node);
     }
@@ -577,11 +874,9 @@ xlate_ofport_set(struct ofproto_dpif *ofproto, struct ofbundle *ofbundle,
     }
 }
 
-void
-xlate_ofport_remove(struct ofport_dpif *ofport)
+static void
+xlate_xport_remove(struct xlate_cfg *xcfg, struct xport *xport)
 {
-    struct xport *xport = xport_lookup(ofport);
-
     if (!xport) {
         return;
     }
@@ -598,13 +893,24 @@ xlate_ofport_remove(struct ofport_dpif *ofport)
     clear_skb_priorities(xport);
     hmap_destroy(&xport->skb_priorities);
 
-    hmap_remove(&xports, &xport->hmap_node);
+    hmap_remove(&xcfg->xports, &xport->hmap_node);
     hmap_remove(&xport->xbridge->xports, &xport->ofp_node);
 
     netdev_close(xport->netdev);
     cfm_unref(xport->cfm);
     bfd_unref(xport->bfd);
     free(xport);
+}
+
+void
+xlate_ofport_remove(struct ofport_dpif *ofport)
+{
+    struct xport *xport;
+
+    ovs_assert(new_xcfg);
+
+    xport = xport_lookup(new_xcfg, ofport);
+    xlate_xport_remove(new_xcfg, xport);
 }
 
 /* Given a datpath, packet, and flow metadata ('backer', 'packet', and 'key'
@@ -637,26 +943,26 @@ xlate_receive(const struct dpif_backer *backer, struct ofpbuf *packet,
               struct dpif_sflow **sflow, struct netflow **netflow,
               odp_port_t *odp_in_port)
 {
-    const struct xport *xport;
+    struct xlate_cfg *xcfg = ovsrcu_get(struct xlate_cfg *, &xcfgp);
     int error = ENODEV;
+    const struct xport *xport;
 
-    ovs_rwlock_rdlock(&xlate_rwlock);
     if (odp_flow_key_to_flow(key, key_len, flow) == ODP_FIT_ERROR) {
         error = EINVAL;
-        goto exit;
+        return error;
     }
 
     if (odp_in_port) {
         *odp_in_port = flow->in_port.odp_port;
     }
 
-    xport = xport_lookup(tnl_port_should_receive(flow)
+    xport = xport_lookup(xcfg, tnl_port_should_receive(flow)
                          ? tnl_port_receive(flow)
                          : odp_port_to_ofport(backer, flow->in_port.odp_port));
 
     flow->in_port.ofp_port = xport ? xport->ofp_port : OFPP_NONE;
     if (!xport) {
-        goto exit;
+        return error;
     }
 
     if (vsp_adjust_flow(xport->xbridge->ofproto, flow)) {
@@ -685,23 +991,23 @@ xlate_receive(const struct dpif_backer *backer, struct ofpbuf *packet,
     if (netflow) {
         *netflow = netflow_ref(xport->xbridge->netflow);
     }
-
-exit:
-    ovs_rwlock_unlock(&xlate_rwlock);
     return error;
 }
 
 static struct xbridge *
-xbridge_lookup(const struct ofproto_dpif *ofproto)
+xbridge_lookup(struct xlate_cfg *xcfg, const struct ofproto_dpif *ofproto)
 {
+    struct hmap *xbridges;
     struct xbridge *xbridge;
 
-    if (!ofproto) {
+    if (!ofproto || !xcfg) {
         return NULL;
     }
 
+    xbridges = &xcfg->xbridges;
+
     HMAP_FOR_EACH_IN_BUCKET (xbridge, hmap_node, hash_pointer(ofproto, 0),
-                             &xbridges) {
+                             xbridges) {
         if (xbridge->ofproto == ofproto) {
             return xbridge;
         }
@@ -710,16 +1016,19 @@ xbridge_lookup(const struct ofproto_dpif *ofproto)
 }
 
 static struct xbundle *
-xbundle_lookup(const struct ofbundle *ofbundle)
+xbundle_lookup(struct xlate_cfg *xcfg, const struct ofbundle *ofbundle)
 {
+    struct hmap *xbundles;
     struct xbundle *xbundle;
 
-    if (!ofbundle) {
+    if (!ofbundle || !xcfg) {
         return NULL;
     }
 
+    xbundles = &xcfg->xbundles;
+
     HMAP_FOR_EACH_IN_BUCKET (xbundle, hmap_node, hash_pointer(ofbundle, 0),
-                             &xbundles) {
+                             xbundles) {
         if (xbundle->ofbundle == ofbundle) {
             return xbundle;
         }
@@ -728,16 +1037,19 @@ xbundle_lookup(const struct ofbundle *ofbundle)
 }
 
 static struct xport *
-xport_lookup(const struct ofport_dpif *ofport)
+xport_lookup(struct xlate_cfg *xcfg, const struct ofport_dpif *ofport)
 {
+    struct hmap *xports;
     struct xport *xport;
 
-    if (!ofport) {
+    if (!ofport || !xcfg) {
         return NULL;
     }
 
+    xports = &xcfg->xports;
+
     HMAP_FOR_EACH_IN_BUCKET (xport, hmap_node, hash_pointer(ofport, 0),
-                             &xports) {
+                             xports) {
         if (xport->ofport == ofport) {
             return xport;
         }
@@ -1079,7 +1391,8 @@ add_mirror_actions(struct xlate_ctx *ctx, const struct flow *orig_flow)
         mirrors &= ~dup_mirrors;
         ctx->xout->mirrors |= dup_mirrors;
         if (out) {
-            struct xbundle *out_xbundle = xbundle_lookup(out);
+            struct xlate_cfg *xcfg = ovsrcu_get(struct xlate_cfg *, &xcfgp);
+            struct xbundle *out_xbundle = xbundle_lookup(xcfg, out);
             if (out_xbundle) {
                 output_normal(ctx, out_xbundle, vlan);
             }
@@ -1221,9 +1534,10 @@ output_normal(struct xlate_ctx *ctx, const struct xbundle *out_xbundle,
         xport = CONTAINER_OF(list_front(&out_xbundle->xports), struct xport,
                              bundle_node);
     } else {
-        struct ofport_dpif *ofport;
-        struct xlate_recirc *xr = &ctx->recirc;
+        struct xlate_cfg *xcfg = ovsrcu_get(struct xlate_cfg *, &xcfgp);
         struct flow_wildcards *wc = &ctx->xout->wc;
+        struct xlate_recirc *xr = &ctx->recirc;
+        struct ofport_dpif *ofport;
 
         if (ctx->xbridge->enable_recirc) {
             ctx->use_recirc = bond_may_recirc(
@@ -1241,7 +1555,7 @@ output_normal(struct xlate_ctx *ctx, const struct xbundle *out_xbundle,
 
         ofport = bond_choose_output_slave(out_xbundle->bond,
                                           &ctx->xin->flow, wc, vid);
-        xport = xport_lookup(ofport);
+        xport = xport_lookup(xcfg, ofport);
 
         if (!xport) {
             /* No slaves enabled, so drop packet. */
@@ -1586,7 +1900,8 @@ xlate_normal(struct xlate_ctx *ctx)
     ovs_rwlock_unlock(&ctx->xbridge->ml->rwlock);
 
     if (mac_port) {
-        struct xbundle *mac_xbundle = xbundle_lookup(mac_port);
+        struct xlate_cfg *xcfg = ovsrcu_get(struct xlate_cfg *, &xcfgp);
+        struct xbundle *mac_xbundle = xbundle_lookup(xcfg, mac_port);
         if (mac_xbundle && mac_xbundle != in_xbundle) {
             xlate_report(ctx, "forwarding to learned port");
             output_normal(ctx, mac_xbundle, vlan);
@@ -1900,7 +2215,6 @@ compose_output_action__(struct xlate_ctx *ctx, ofp_port_t ofp_port,
             entry->u.dev.rx = netdev_ref(peer->netdev);
             entry->u.dev.bfd = bfd_ref(peer->bfd);
         }
-
         return;
     }
 
@@ -2665,35 +2979,38 @@ xlate_bundle_action(struct xlate_ctx *ctx,
 }
 
 static void
-xlate_learn_action(struct xlate_ctx *ctx,
-                   const struct ofpact_learn *learn)
+xlate_learn_action__(struct xlate_ctx *ctx, const struct ofpact_learn *learn,
+                     struct ofputil_flow_mod *fm, struct ofpbuf *ofpacts)
 {
-    uint64_t ofpacts_stub[1024 / 8];
-    struct ofputil_flow_mod fm;
-    struct ofpbuf ofpacts;
-
-    ctx->xout->has_learn = true;
-
-    learn_mask(learn, &ctx->xout->wc);
-
-    if (!ctx->xin->may_learn) {
-        return;
+    learn_execute(learn, &ctx->xin->flow, fm, ofpacts);
+    if (ctx->xin->may_learn) {
+        ofproto_dpif_flow_mod(ctx->xbridge->ofproto, fm);
     }
+}
 
-    ofpbuf_use_stub(&ofpacts, ofpacts_stub, sizeof ofpacts_stub);
-    learn_execute(learn, &ctx->xin->flow, &fm, &ofpacts);
-    ofproto_dpif_flow_mod(ctx->xbridge->ofproto, &fm);
-    ofpbuf_uninit(&ofpacts);
+static void
+xlate_learn_action(struct xlate_ctx *ctx, const struct ofpact_learn *learn)
+{
+    ctx->xout->has_learn = true;
+    learn_mask(learn, &ctx->xout->wc);
 
     if (ctx->xin->xcache) {
         struct xc_entry *entry;
 
         entry = xlate_cache_add_entry(ctx->xin->xcache, XC_LEARN);
-        entry->u.learn.ofproto = ctx->xin->ofproto;
-        /* Lookup the learned rule, taking a reference on it.  The reference
-         * is released when this cache entry is deleted. */
-        rule_dpif_lookup(ctx->xbridge->ofproto, &ctx->xin->flow, NULL,
-                         &entry->u.learn.rule, true, NULL);
+        entry->u.learn.ofproto = ctx->xbridge->ofproto;
+        entry->u.learn.fm = xmalloc(sizeof *entry->u.learn.fm);
+        entry->u.learn.ofpacts = ofpbuf_new(64);
+        xlate_learn_action__(ctx, learn, entry->u.learn.fm,
+                             entry->u.learn.ofpacts);
+    } else if (ctx->xin->may_learn) {
+        uint64_t ofpacts_stub[1024 / 8];
+        struct ofputil_flow_mod fm;
+        struct ofpbuf ofpacts;
+
+        ofpbuf_use_stub(&ofpacts, ofpacts_stub, sizeof ofpacts_stub);
+        xlate_learn_action__(ctx, learn, &fm, &ofpacts);
+        ofpbuf_uninit(&ofpacts);
     }
 }
 
@@ -3200,25 +3517,15 @@ actions_output_to_local_port(const struct xlate_ctx *ctx)
     return false;
 }
 
-/* Thread safe call to xlate_actions__(). */
-void
-xlate_actions(struct xlate_in *xin, struct xlate_out *xout)
-    OVS_EXCLUDED(xlate_rwlock)
-{
-    ovs_rwlock_rdlock(&xlate_rwlock);
-    xlate_actions__(xin, xout);
-    ovs_rwlock_unlock(&xlate_rwlock);
-}
-
 /* Translates the 'ofpacts_len' bytes of "struct ofpacts" starting at 'ofpacts'
  * into datapath actions in 'odp_actions', using 'ctx'.
  *
  * The caller must take responsibility for eventually freeing 'xout', with
  * xlate_out_uninit(). */
-static void
-xlate_actions__(struct xlate_in *xin, struct xlate_out *xout)
-    OVS_REQ_RDLOCK(xlate_rwlock)
+void
+xlate_actions(struct xlate_in *xin, struct xlate_out *xout)
 {
+    struct xlate_cfg *xcfg = ovsrcu_get(struct xlate_cfg *, &xcfgp);
     struct flow_wildcards *wc = &xout->wc;
     struct flow *flow = &xin->flow;
     struct rule_dpif *rule = NULL;
@@ -3268,7 +3575,7 @@ xlate_actions__(struct xlate_in *xin, struct xlate_out *xout)
                     sizeof ctx.xout->odp_actions_stub);
     ofpbuf_reserve(&ctx.xout->odp_actions, NL_A_U32_SIZE);
 
-    ctx.xbridge = xbridge_lookup(xin->ofproto);
+    ctx.xbridge = xbridge_lookup(xcfg, xin->ofproto);
     if (!ctx.xbridge) {
         return;
     }
@@ -3501,6 +3808,7 @@ xlate_actions__(struct xlate_in *xin, struct xlate_out *xout)
 int
 xlate_send_packet(const struct ofport_dpif *ofport, struct ofpbuf *packet)
 {
+    struct xlate_cfg *xcfg = ovsrcu_get(struct xlate_cfg *, &xcfgp);
     struct xport *xport;
     struct ofpact_output output;
     struct flow flow;
@@ -3510,15 +3818,12 @@ xlate_send_packet(const struct ofport_dpif *ofport, struct ofpbuf *packet)
     flow_extract(packet, NULL, &flow);
     flow.in_port.ofp_port = OFPP_NONE;
 
-    ovs_rwlock_rdlock(&xlate_rwlock);
-    xport = xport_lookup(ofport);
+    xport = xport_lookup(xcfg, ofport);
     if (!xport) {
-        ovs_rwlock_unlock(&xlate_rwlock);
         return EINVAL;
     }
     output.port = xport->ofp_port;
     output.max_len = 0;
-    ovs_rwlock_unlock(&xlate_rwlock);
 
     return ofproto_dpif_execute_actions(xport->xbridge->ofproto, &flow, NULL,
                                         &output.ofpact, sizeof output,
@@ -3562,11 +3867,12 @@ xlate_cache_netdev(struct xc_entry *entry, const struct dpif_flow_stats *stats)
 static void
 xlate_cache_normal(struct ofproto_dpif *ofproto, struct flow *flow, int vlan)
 {
+    struct xlate_cfg *xcfg = ovsrcu_get(struct xlate_cfg *, &xcfgp);
     struct xbridge *xbridge;
     struct xbundle *xbundle;
     struct flow_wildcards wc;
 
-    xbridge = xbridge_lookup(ofproto);
+    xbridge = xbridge_lookup(xcfg, ofproto);
     if (!xbridge) {
         return;
     }
@@ -3611,12 +3917,8 @@ xlate_push_stats(struct xlate_cache *xcache, bool may_learn,
             break;
         case XC_LEARN:
             if (may_learn) {
-                struct rule_dpif *rule = entry->u.learn.rule;
-
-                /* Reset the modified time for a rule that is equivalent to
-                 * the currently cached rule.  If the rule is not the exact
-                 * rule we have cached, update the reference that we have. */
-                entry->u.learn.rule = ofproto_dpif_refresh_rule(rule);
+                ofproto_dpif_flow_mod(entry->u.learn.ofproto,
+                                      entry->u.learn.fm);
             }
             break;
         case XC_NORMAL:
@@ -3689,8 +3991,8 @@ xlate_cache_clear(struct xlate_cache *xcache)
             mbridge_unref(entry->u.mirror.mbridge);
             break;
         case XC_LEARN:
-            /* 'u.learn.rule' is the learned rule. */
-            rule_dpif_unref(entry->u.learn.rule);
+            free(entry->u.learn.fm);
+            ofpbuf_delete(entry->u.learn.ofpacts);
             break;
         case XC_NORMAL:
             free(entry->u.normal.flow);

@@ -205,7 +205,7 @@ dpdk_rte_mzalloc(size_t sz)
 void
 free_dpdk_buf(struct ofpbuf *b)
 {
-    struct rte_mbuf *pkt = (struct rte_mbuf *) b;
+    struct rte_mbuf *pkt = (struct rte_mbuf *) b->dpdk_buf;
 
     rte_mempool_put(pkt->pool, pkt);
 }
@@ -369,7 +369,8 @@ dpdk_eth_dev_init(struct netdev_dpdk *dev) OVS_REQUIRES(dpdk_mutex)
     }
 
     for (i = 0; i < NR_QUEUE; i++) {
-        diag = rte_eth_tx_queue_setup(dev->port_id, i, 64, 0, &tx_conf);
+        diag = rte_eth_tx_queue_setup(dev->port_id, i, MAX_TX_QUEUE_LEN,
+                                      dev->socket_id, &tx_conf);
         if (diag) {
             VLOG_ERR("eth dev tx queue setup error %d",diag);
             return diag;
@@ -377,8 +378,9 @@ dpdk_eth_dev_init(struct netdev_dpdk *dev) OVS_REQUIRES(dpdk_mutex)
     }
 
     for (i = 0; i < NR_QUEUE; i++) {
-        diag = rte_eth_rx_queue_setup(dev->port_id, i, 64, 0, &rx_conf,
-                                      dev->dpdk_mp->mp);
+        diag = rte_eth_rx_queue_setup(dev->port_id, i, MAX_RX_QUEUE_LEN,
+                                      dev->socket_id,
+                                      &rx_conf, dev->dpdk_mp->mp);
         if (diag) {
             VLOG_ERR("eth dev rx queue setup error %d",diag);
             return diag;
@@ -594,7 +596,9 @@ netdev_dpdk_rxq_recv(struct netdev_rxq *rxq_, struct ofpbuf **packets, int *c)
     dpdk_queue_flush(dev, rxq_->queue_id);
 
     nb_rx = rte_eth_rx_burst(rx->port_id, rxq_->queue_id,
-                             (struct rte_mbuf **) packets, MAX_RX_QUEUE_LEN);
+                             (struct rte_mbuf **) packets,
+                             MIN((int)NETDEV_MAX_RX_BATCH,
+                                 (int)MAX_RX_QUEUE_LEN));
     if (!nb_rx) {
         return EAGAIN;
     }

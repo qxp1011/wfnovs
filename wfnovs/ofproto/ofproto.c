@@ -1978,47 +1978,6 @@ ofproto_flow_mod(struct ofproto *ofproto, struct ofputil_flow_mod *fm)
     return handle_flow_mod__(ofproto, NULL, fm, NULL);
 }
 
-/* Resets the modified time for 'rule' or an equivalent rule. If 'rule' is not
- * in the classifier, but an equivalent rule is, unref 'rule' and ref the new
- * rule. Otherwise if 'rule' is no longer installed in the classifier,
- * reinstall it.
- *
- * Returns the rule whose modified time has been reset. */
-struct rule *
-ofproto_refresh_rule(struct rule *rule)
-{
-    const struct oftable *table = &rule->ofproto->tables[rule->table_id];
-    const struct cls_rule *cr = &rule->cr;
-    struct rule *r;
-
-    /* do_add_flow() requires that the rule is not installed. We lock the
-     * ofproto_mutex here so that another thread cannot add the flow before
-     * we get a chance to add it.*/
-    ovs_mutex_lock(&ofproto_mutex);
-
-    fat_rwlock_rdlock(&table->cls.rwlock);
-    r = rule_from_cls_rule(classifier_find_rule_exactly(&table->cls, cr));
-    if (r != rule) {
-        ofproto_rule_ref(r);
-    }
-    fat_rwlock_unlock(&table->cls.rwlock);
-
-    if (!r) {
-        do_add_flow(rule->ofproto, NULL, NULL, 0, rule);
-    } else if  (r != rule) {
-        ofproto_rule_unref(rule);
-        rule = r;
-    }
-    ovs_mutex_unlock(&ofproto_mutex);
-
-    /* Refresh the modified time for the rule. */
-    ovs_mutex_lock(&rule->mutex);
-    rule->modified = MAX(rule->modified, time_msec());
-    ovs_mutex_unlock(&rule->mutex);
-
-    return rule;
-}
-
 /* Searches for a rule with matching criteria exactly equal to 'target' in
  * ofproto's table 0 and, if it finds one, deletes it.
  *
@@ -5032,8 +4991,6 @@ handle_flow_monitor_cancel(struct ofconn *ofconn, const struct ofp_header *oh)
 /* Meters implementation.
  *
  * Meter table entry, indexed by the OpenFlow meter_id.
- * These are always dynamically allocated to allocate enough space for
- * the bands.
  * 'created' is used to compute the duration for meter stats.
  * 'list rules' is needed so that we can delete the dependent rules when the
  * meter table entry is deleted.
@@ -5630,19 +5587,9 @@ init_group(struct ofproto *ofproto, struct ofputil_group_mod *gm,
     return error;
 }
 
-/* Implements OFPGC11_ADD
- * in which no matching flow already exists in the flow table.
- *
- * Adds the flow specified by 'ofm', which is followed by 'n_actions'
- * ofp_actions, to the ofproto's flow table.  Returns 0 on success, an OpenFlow
- * error code on failure, or OFPROTO_POSTPONE if the operation cannot be
- * initiated now but may be retried later.
- *
- * Upon successful return, takes ownership of 'fm->ofpacts'.  On failure,
- * ownership remains with the caller.
- *
- * 'ofconn' is used to retrieve the packet buffer specified in ofm->buffer_id,
- * if any. */
+/* Implements the OFPGC11_ADD operation specified by 'gm', adding a group to
+ * 'ofproto''s group table.  Returns 0 on success or an OpenFlow error code on
+ * failure. */
 static enum ofperr
 add_group(struct ofproto *ofproto, struct ofputil_group_mod *gm)
 {
@@ -5688,15 +5635,12 @@ add_group(struct ofproto *ofproto, struct ofputil_group_mod *gm)
     return error;
 }
 
-/* Implements OFPFC_MODIFY.  Returns 0 on success or an OpenFlow error code on
- * failure.
+/* Implements OFPGC11_MODIFY.  Returns 0 on success or an OpenFlow error code
+ * on failure.
  *
  * Note that the group is re-created and then replaces the old group in
  * ofproto's ofgroup hash map. Thus, the group is never altered while users of
- * the xlate module hold a pointer to the group.
- *
- * 'ofconn' is used to retrieve the packet buffer specified in fm->buffer_id,
- * if any. */
+ * the xlate module hold a pointer to the group. */
 static enum ofperr
 modify_group(struct ofproto *ofproto, struct ofputil_group_mod *gm)
 {
@@ -5768,7 +5712,7 @@ delete_group__(struct ofproto *ofproto, struct ofgroup *ofgroup)
     ofproto_group_unref(ofgroup);
 }
 
-/* Implements OFPGC_DELETE. */
+/* Implements OFPGC11_DELETE. */
 static void
 delete_group(struct ofproto *ofproto, uint32_t group_id)
 {
@@ -6285,8 +6229,6 @@ ofopgroup_complete(struct ofopgroup *group)
               || (op->type == OFOPERATION_MODIFY
                   && op->actions
                   && rule->flow_cookie == op->flow_cookie))) {
-            /* Check that we can just cast from ofoperation_type to
-             * nx_flow_update_event. */
             enum nx_flow_update_event event_type;
 
             switch (op->type) {

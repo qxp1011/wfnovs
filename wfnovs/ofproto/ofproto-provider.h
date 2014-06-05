@@ -72,7 +72,7 @@ struct ofproto {
     uint64_t datapath_id;       /* Datapath ID. */
     bool forward_bpdu;          /* Option to allow forwarding of BPDU frames
                                  * when NORMAL action is invoked. */
-    char *mfr_desc;             /* Manufacturer (NULL for default)b. */
+    char *mfr_desc;             /* Manufacturer (NULL for default). */
     char *hw_desc;              /* Hardware (NULL for default). */
     char *sw_desc;              /* Software version (NULL for default). */
     char *serial_desc;          /* Serial number (NULL for default). */
@@ -1715,8 +1715,6 @@ enum { OFPROTO_POSTPONE = 1 << 16 };
 BUILD_ASSERT_DECL(OFPROTO_POSTPONE < OFPERR_OFS);
 
 int ofproto_flow_mod(struct ofproto *, struct ofputil_flow_mod *)
-    OVS_EXCLUDED(ofproto_mutex);
-struct rule *ofproto_refresh_rule(struct rule *rule)
     OVS_EXCLUDED(ofproto_mutex);
 void ofproto_add_flow(struct ofproto *, const struct match *,
                       unsigned int priority,

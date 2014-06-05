@@ -1325,7 +1325,7 @@ dnl Modified MPLS controller action.
 AT_CHECK([ovs-ofctl monitor br0 65534 -P nxm --detach --pidfile 2> ofctl_monitor.log])
 
 for i in 1 2 3; do
-    ovs-appctl netdev-dummy/receive p1 'in_port(1),eth(src=40:44:44:44:44:42,dst=50:54:00:00:00:07),eth_type(0x0800),ipv4(src=192.168.0.1,dst=192.168.0.2,proto=16,tos=0,ttl=64,frag=no)'
+    ovs-appctl netdev-dummy/receive p1 'in_port(1),eth(src=40:44:44:44:44:42,dst=50:54:00:00:00:07),eth_type(0x0800),ipv4(src=192.168.0.1,dst=192.168.0.2,proto=17,tos=0,ttl=64,frag=no),udp(src=7777,dst=80)'
 done
 OVS_WAIT_UNTIL([test `wc -l < ofctl_monitor.log` -ge 6])
 OVS_APP_EXIT_AND_WAIT(ovs-ofctl)
@@ -3056,7 +3056,7 @@ m4_define([CHECK_SFLOW_SAMPLING_PACKET],
   ON_EXIT([kill `cat test-sflow.pid`])
   AT_CHECK([ovstest test-sflow --log-file --detach --no-chdir --pidfile 0:$1 > sflow.log], [0], [], [ignore])
   AT_CAPTURE_FILE([sflow.log])
-  SFLOW_PORT=`parse_listening_port test-sflow.log`
+  SFLOW_PORT=`parse_listening_port < test-sflow.log`
   ovs-appctl time/stop
 
   ADD_OF_PORTS([br0], 1, 2)
@@ -3363,7 +3363,7 @@ m4_define([CHECK_NETFLOW_EXPIRATION],
   ON_EXIT([kill `cat test-netflow.pid`])
   AT_CHECK([ovstest test-netflow --log-file --detach --no-chdir --pidfile 0:$1 > netflow.log], [0], [], [ignore])
   AT_CAPTURE_FILE([netflow.log])
-  NETFLOW_PORT=`parse_listening_port test-netflow.log`
+  NETFLOW_PORT=`parse_listening_port < test-netflow.log`
 
   ovs-vsctl \
      set Bridge br0 netflow=@nf -- \
@@ -3410,7 +3410,7 @@ m4_define([CHECK_NETFLOW_ACTIVE_EXPIRATION],
   ON_EXIT([kill `cat test-netflow.pid`])
   AT_CHECK([ovstest test-netflow --log-file --detach --no-chdir --pidfile 0:$1 > netflow.log], [0], [], [ignore])
   AT_CAPTURE_FILE([netflow.log])
-  NETFLOW_PORT=`parse_listening_port test-netflow.log`
+  NETFLOW_PORT=`parse_listening_port < test-netflow.log`
 
   ovs-vsctl \
      set Bridge br0 netflow=@nf -- \
@@ -3619,10 +3619,6 @@ AT_CLEANUP
 
 AT_SETUP([ofproto-dpif - fin_timeout])
 OVS_VSWITCHD_START
-AT_DATA([flows.txt], [dnl
-in_port=1 actions=output:2
-in_port=2 actions=mod_vlan_vid:17,output:1
-])
 ovs-appctl time/stop
 AT_CHECK([ovs-ofctl add-flow br0 'idle_timeout=60,actions=fin_timeout(idle_timeout=5)'])
 AT_CHECK([ovs-ofctl dump-flows br0 | ofctl_strip], [0],
@@ -4026,7 +4022,7 @@ m4_define([CHECK_MEGAFLOW_NETFLOW],
   ON_EXIT([kill `cat test-netflow.pid`])
   AT_CHECK([ovstest test-netflow --log-file --detach --no-chdir --pidfile 0:$1 > netflow.log], [0], [], [ignore])
   AT_CAPTURE_FILE([netflow.log])
-  NETFLOW_PORT=`parse_listening_port test-netflow.log`
+  NETFLOW_PORT=`parse_listening_port < test-netflow.log`
   ovs-vsctl \
      set Bridge br0 netflow=@nf -- \
      --id=@nf create NetFlow targets=\"$1:$NETFLOW_PORT\" \
@@ -4631,7 +4627,7 @@ OVS_VSWITCHD_STOP(["/resubmits yielded over 64 kB of stack/d"])
 AT_CLEANUP
 
 
-AT_SETUP([ofproto-if packet-out controller])
+AT_SETUP([ofproto-dpif packet-out controller])
 OVS_VSWITCHD_START
 ADD_OF_PORTS([br0], 1, 2)
 
@@ -4674,7 +4670,7 @@ OVS_VSWITCHD_STOP
 AT_CLEANUP
 
 
-AT_SETUP([ofproto-if packet-out controller (patch port)])
+AT_SETUP([ofproto-dpif packet-out controller (patch port)])
 OVS_VSWITCHD_START(
   [-- \
    add-port br0 p1 -- \
@@ -4726,7 +4722,7 @@ OVS_VSWITCHD_STOP
 AT_CLEANUP
 
 
-AT_SETUP([ofproto-if packet-out goto_table])
+AT_SETUP([ofproto-dpif packet-out goto_table])
 OVS_VSWITCHD_START
 ADD_OF_PORTS([br0], 1, 2)
 
@@ -4778,7 +4774,7 @@ OVS_VSWITCHD_STOP
 AT_CLEANUP
 
 
-AT_SETUP([ofproto-if packet-out table-miss (continue)])
+AT_SETUP([ofproto-dpif packet-out table-miss (continue)])
 OVS_VSWITCHD_START
 ADD_OF_PORTS([br0], 1, 2)
 
@@ -4821,6 +4817,26 @@ OFPST_FLOW reply (OF1.3):
    x=`expr $x + 1`
  done) > expout
 AT_CHECK([ovs-ofctl -O OpenFlow13 dump-tables br0 ], [0], [expout])
+
+OVS_VSWITCHD_STOP
+AT_CLEANUP
+
+AT_SETUP([ofproto-dpif - ICMPv6])
+OVS_VSWITCHD_START
+ADD_OF_PORTS([br0], 1)
+
+AT_CAPTURE_FILE([ofctl_monitor.log])
+
+AT_CHECK([ovs-ofctl monitor br0 65534 --detach --no-chdir --pidfile 2> ofctl_monitor.log])
+
+ovs-appctl netdev-dummy/receive p1 '0060970769ea0000860580da86dd6000000000203afffe80000000000000020086fffe0580dafe80000000000000026097fffe0769ea870068bd00000000fe80000000000000026097fffe0769ea01010000860580da'
+
+OVS_WAIT_UNTIL([ovs-appctl -t ovs-ofctl exit])
+
+AT_CHECK([cat ofctl_monitor.log], [0], [dnl
+NXT_PACKET_IN (xid=0x0): cookie=0x0 total_len=86 in_port=1 (via no_match) data_len=86 (unbuffered)
+icmp6,metadata=0,in_port=0,vlan_tci=0x0000,dl_src=00:00:86:05:80:da,dl_dst=00:60:97:07:69:ea,ipv6_src=fe80::200:86ff:fe05:80da,ipv6_dst=fe80::260:97ff:fe07:69ea,ipv6_label=0x00000,nw_tos=0,nw_ecn=0,nw_ttl=255,icmp_type=135,icmp_code=0,nd_target=fe80::260:97ff:fe07:69ea,nd_sll=00:00:86:05:80:da,nd_tll=00:00:00:00:00:00
+])
 
 OVS_VSWITCHD_STOP
 AT_CLEANUP

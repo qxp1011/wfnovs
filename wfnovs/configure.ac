@@ -21,7 +21,7 @@ AC_CONFIG_HEADERS([config.h])
 AC_CONFIG_TESTDIR([tests])
 AM_INIT_AUTOMAKE
 
-AC_PROG_CC
+AC_PROG_CC_C99
 AM_PROG_CC_C_O
 AC_PROG_CPP
 AC_PROG_MKDIR_P
@@ -100,7 +100,6 @@ OVS_ENABLE_OPTION([-Wall])
 OVS_ENABLE_OPTION([-Wextra])
 OVS_ENABLE_OPTION([-Wno-sign-compare])
 OVS_ENABLE_OPTION([-Wpointer-arith])
-OVS_ENABLE_OPTION([-Wdeclaration-after-statement])
 OVS_ENABLE_OPTION([-Wformat-security])
 OVS_ENABLE_OPTION([-Wno-format-zero-length])
 OVS_ENABLE_OPTION([-Wswitch-enum])
